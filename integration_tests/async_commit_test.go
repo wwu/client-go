@@ -76,9 +76,7 @@ type unistoreClientWrapper struct {
 	*unistore.RPCClient
 }
 
-func (c *unistoreClientWrapper) CloseAddr(addr string) error {
-	return nil
-}
+func (c *unistoreClientWrapper) SetEventListener(listener tikv.ClientEventListener) {}
 
 func (s *testAsyncCommitCommon) setUpTest() {
 	if *withTiKV {
@@ -86,7 +84,7 @@ func (s *testAsyncCommitCommon) setUpTest() {
 		return
 	}
 
-	client, pdClient, cluster, err := unistore.New("")
+	client, pdClient, cluster, err := unistore.New("", nil)
 	s.Require().Nil(err)
 
 	unistore.BootstrapWithSingleStore(cluster)

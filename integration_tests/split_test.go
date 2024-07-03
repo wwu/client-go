@@ -201,7 +201,7 @@ func (c *mockPDClient) GetRegion(ctx context.Context, key []byte, opts ...pd.Get
 	return c.client.GetRegion(ctx, key, opts...)
 }
 
-func (c *mockPDClient) GetRegionFromMember(ctx context.Context, key []byte, memberURLs []string) (*pd.Region, error) {
+func (c *mockPDClient) GetRegionFromMember(ctx context.Context, key []byte, memberURLs []string, opts ...pd.GetRegionOption) (*pd.Region, error) {
 	return nil, nil
 }
 
@@ -225,7 +225,7 @@ func (c *mockPDClient) GetRegionByID(ctx context.Context, regionID uint64, opts 
 	return c.client.GetRegionByID(ctx, regionID, opts...)
 }
 
-func (c *mockPDClient) ScanRegions(ctx context.Context, startKey []byte, endKey []byte, limit int) ([]*pd.Region, error) {
+func (c *mockPDClient) ScanRegions(ctx context.Context, startKey []byte, endKey []byte, limit int, opts ...pd.GetRegionOption) ([]*pd.Region, error) {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -233,6 +233,16 @@ func (c *mockPDClient) ScanRegions(ctx context.Context, startKey []byte, endKey 
 		return nil, errors.WithStack(errStopped)
 	}
 	return c.client.ScanRegions(ctx, startKey, endKey, limit)
+}
+
+func (c *mockPDClient) BatchScanRegions(ctx context.Context, keyRanges []pd.KeyRange, limit int, opts ...pd.GetRegionOption) ([]*pd.Region, error) {
+	c.RLock()
+	defer c.RUnlock()
+
+	if c.stop {
+		return nil, errors.WithStack(errStopped)
+	}
+	return c.client.BatchScanRegions(ctx, keyRanges, limit, opts...)
 }
 
 func (c *mockPDClient) GetStore(ctx context.Context, storeID uint64) (*metapb.Store, error) {
@@ -285,7 +295,7 @@ func (c *mockPDClient) GetOperator(ctx context.Context, regionID uint64) (*pdpb.
 	return &pdpb.GetOperatorResponse{Status: pdpb.OperatorStatus_SUCCESS}, nil
 }
 
-func (c *mockPDClient) GetLeaderAddr() string { return "mockpd" }
+func (c *mockPDClient) GetLeaderURL() string { return "mockpd" }
 
 func (c *mockPDClient) UpdateOption(option pd.DynamicOption, value interface{}) error {
 	return nil
@@ -307,11 +317,11 @@ func (c *mockPDClient) UpdateKeyspaceState(ctx context.Context, id uint32, state
 	return nil, nil
 }
 
-func (c *mockPDClient) ListResourceGroups(ctx context.Context) ([]*rmpb.ResourceGroup, error) {
+func (c *mockPDClient) ListResourceGroups(ctx context.Context, opts ...pd.GetResourceGroupOption) ([]*rmpb.ResourceGroup, error) {
 	return nil, nil
 }
 
-func (c *mockPDClient) GetResourceGroup(ctx context.Context, resourceGroupName string) (*rmpb.ResourceGroup, error) {
+func (c *mockPDClient) GetResourceGroup(ctx context.Context, resourceGroupName string, opts ...pd.GetResourceGroupOption) (*rmpb.ResourceGroup, error) {
 	return nil, nil
 }
 
@@ -388,5 +398,9 @@ func (c *mockPDClient) UpdateServiceSafePointV2(ctx context.Context, keyspaceID 
 }
 
 func (c *mockPDClient) WatchGCSafePointV2(ctx context.Context, revision int64) (chan []*pdpb.SafePointEvent, error) {
+	panic("unimplemented")
+}
+
+func (c *mockPDClient) GetServiceDiscovery() pd.ServiceDiscovery {
 	panic("unimplemented")
 }

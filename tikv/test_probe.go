@@ -37,6 +37,7 @@ package tikv
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/tikv/client-go/v2/config/retry"
@@ -59,8 +60,8 @@ func (s StoreProbe) NewLockResolver() LockResolverProbe {
 }
 
 // Begin starts a transaction.
-func (s StoreProbe) Begin() (transaction.TxnProbe, error) {
-	txn, err := s.KVStore.Begin()
+func (s StoreProbe) Begin(opts ...TxnOption) (transaction.TxnProbe, error) {
+	txn, err := s.KVStore.Begin(opts...)
 	return transaction.TxnProbe{KVTxn: txn}, err
 }
 
@@ -240,5 +241,5 @@ func (c ConfigProbe) StorePreSplitSizeThreshold(v uint32) {
 
 // SetOracleUpdateInterval sets the interval of updating cached ts.
 func (c ConfigProbe) SetOracleUpdateInterval(v int) {
-	oracleUpdateInterval = v
+	defaultOracleUpdateInterval = time.Duration(v) * time.Millisecond
 }
