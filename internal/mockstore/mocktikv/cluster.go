@@ -38,6 +38,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -349,7 +350,7 @@ func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer, 
 }
 
 // ScanRegions returns at most `limit` regions from given `key` and their leaders.
-func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
+func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int, opts ...pd.GetRegionOption) []*pd.Region {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -358,8 +359,8 @@ func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
 		regions = append(regions, region)
 	}
 
-	sort.Slice(regions, func(i, j int) bool {
-		return bytes.Compare(regions[i].Meta.GetStartKey(), regions[j].Meta.GetStartKey()) < 0
+	slices.SortFunc(regions, func(i, j *Region) int {
+		return bytes.Compare(i.Meta.GetStartKey(), j.Meta.GetStartKey())
 	})
 
 	startPos := sort.Search(len(regions), func(i int) bool {
@@ -394,6 +395,7 @@ func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
 			Meta:      proto.Clone(region.Meta).(*metapb.Region),
 			Leader:    leader,
 			DownPeers: c.getDownPeers(region),
+			Buckets:   proto.Clone(region.Buckets).(*metapb.Buckets),
 		}
 		result = append(result, r)
 	}
@@ -413,12 +415,28 @@ func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderP
 	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID)
 }
 
+// PutRegion adds or replaces a region.
+func (c *Cluster) PutRegion(regionID, confVer, ver uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID, confVer, ver)
+}
+
 // AddPeer adds a new Peer for the Region on the Store.
 func (c *Cluster) AddPeer(regionID, storeID, peerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.regions[regionID].addPeer(peerID, storeID)
+	c.regions[regionID].addPeer(peerID, storeID, metapb.PeerRole_Voter)
+}
+
+// AddLearner adds a new learner for the Region on the Store.
+func (c *Cluster) AddLearner(regionID, storeID, peerID uint64) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.regions[regionID].addPeer(peerID, storeID, metapb.PeerRole_Learner)
 }
 
 // RemovePeer removes the Peer from the Region. Note that if the Peer is leader,
@@ -634,7 +652,7 @@ func newPeerMeta(peerID, storeID uint64) *metapb.Peer {
 	}
 }
 
-func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) *Region {
+func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64, epoch ...uint64) *Region {
 	if len(storeIDs) != len(peerIDs) {
 		panic("len(storeIDs) != len(peerIds)")
 	}
@@ -647,14 +665,20 @@ func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64)
 		Peers:       peers,
 		RegionEpoch: &metapb.RegionEpoch{},
 	}
+	if len(epoch) == 2 {
+		meta.RegionEpoch.ConfVer = epoch[0]
+		meta.RegionEpoch.Version = epoch[1]
+	}
 	return &Region{
 		Meta:   meta,
 		leader: leaderPeerID,
 	}
 }
 
-func (r *Region) addPeer(peerID, storeID uint64) {
-	r.Meta.Peers = append(r.Meta.Peers, newPeerMeta(peerID, storeID))
+func (r *Region) addPeer(peerID, storeID uint64, role metapb.PeerRole) {
+	peer := newPeerMeta(peerID, storeID)
+	peer.Role = role
+	r.Meta.Peers = append(r.Meta.Peers, peer)
 	r.incConfVer()
 }
 

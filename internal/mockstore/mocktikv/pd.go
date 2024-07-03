@@ -35,6 +35,7 @@
 package mocktikv
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -48,8 +49,11 @@ import (
 	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
 	"github.com/pkg/errors"
 	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/util"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/atomic"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Use global variables to prevent pdClients from creating duplicate timestamps.
@@ -60,6 +64,16 @@ var tsMu = struct {
 }{}
 
 const defaultResourceGroupName = "default"
+
+var _ pd.Client = (*pdClient)(nil)
+
+type MockPDOption func(*pdClient)
+
+func WithDelay(delay *atomic.Bool) MockPDOption {
+	return func(pc *pdClient) {
+		pc.delay = delay
+	}
+}
 
 type pdClient struct {
 	cluster *Cluster
@@ -73,11 +87,13 @@ type pdClient struct {
 	externalTimestamp atomic.Uint64
 
 	groups map[string]*rmpb.ResourceGroup
+
+	delay *atomic.Bool
 }
 
 // NewPDClient creates a mock pd.Client that uses local timestamp and meta data
 // from a Cluster.
-func NewPDClient(cluster *Cluster) pd.Client {
+func NewPDClient(cluster *Cluster, ops ...MockPDOption) *pdClient {
 	mockCli := &pdClient{
 		cluster:           cluster,
 		serviceSafePoints: make(map[string]uint64),
@@ -96,6 +112,9 @@ func NewPDClient(cluster *Cluster) pd.Client {
 			},
 		},
 		Priority: 8,
+	}
+	for _, op := range ops {
+		op(mockCli)
 	}
 	return mockCli
 }
@@ -206,10 +225,16 @@ func (c *pdClient) GetRegion(ctx context.Context, key []byte, opts ...pd.GetRegi
 	if len(opts) == 0 {
 		buckets = nil
 	}
+	if c.delay != nil && c.delay.Load() {
+		select {
+		case <-ctx.Done():
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 	return &pd.Region{Meta: region, Leader: peer, Buckets: buckets, DownPeers: downPeers}, nil
 }
 
-func (c *pdClient) GetRegionFromMember(ctx context.Context, key []byte, memberURLs []string) (*pd.Region, error) {
+func (c *pdClient) GetRegionFromMember(ctx context.Context, key []byte, memberURLs []string, opts ...pd.GetRegionOption) (*pd.Region, error) {
 	return &pd.Region{}, nil
 }
 
@@ -226,8 +251,36 @@ func (c *pdClient) GetRegionByID(ctx context.Context, regionID uint64, opts ...p
 	return &pd.Region{Meta: region, Leader: peer, Buckets: buckets, DownPeers: downPeers}, nil
 }
 
-func (c *pdClient) ScanRegions(ctx context.Context, startKey []byte, endKey []byte, limit int) ([]*pd.Region, error) {
-	regions := c.cluster.ScanRegions(startKey, endKey, limit)
+func (c *pdClient) ScanRegions(ctx context.Context, startKey []byte, endKey []byte, limit int, opts ...pd.GetRegionOption) ([]*pd.Region, error) {
+	regions := c.cluster.ScanRegions(startKey, endKey, limit, opts...)
+	return regions, nil
+}
+
+func (c *pdClient) BatchScanRegions(ctx context.Context, keyRanges []pd.KeyRange, limit int, opts ...pd.GetRegionOption) ([]*pd.Region, error) {
+	if _, err := util.EvalFailpoint("mockBatchScanRegionsUnimplemented"); err == nil {
+		return nil, status.Errorf(codes.Unimplemented, "mock BatchScanRegions is not implemented")
+	}
+	regions := make([]*pd.Region, 0, len(keyRanges))
+	var lastRegion *pd.Region
+	for _, keyRange := range keyRanges {
+		if lastRegion != nil && lastRegion.Meta != nil {
+			if lastRegion.Meta.EndKey == nil || bytes.Compare(lastRegion.Meta.EndKey, keyRange.EndKey) >= 0 {
+				continue
+			}
+			if bytes.Compare(lastRegion.Meta.EndKey, keyRange.StartKey) > 0 {
+				keyRange.StartKey = lastRegion.Meta.EndKey
+			}
+		}
+		rangeRegions := c.cluster.ScanRegions(keyRange.StartKey, keyRange.EndKey, limit, opts...)
+		if len(rangeRegions) > 0 {
+			lastRegion = rangeRegions[len(rangeRegions)-1]
+		}
+		regions = append(regions, rangeRegions...)
+		limit -= len(regions)
+		if limit <= 0 {
+			break
+		}
+	}
 	return regions, nil
 }
 
@@ -322,7 +375,7 @@ func (c *pdClient) GetAllMembers(ctx context.Context) ([]*pdpb.Member, error) {
 	return nil, nil
 }
 
-func (c *pdClient) GetLeaderAddr() string { return "mockpd" }
+func (c *pdClient) GetLeaderURL() string { return "mockpd" }
 
 func (c *pdClient) UpdateOption(option pd.DynamicOption, value interface{}) error {
 	return nil
@@ -340,11 +393,11 @@ func (c *pdClient) UpdateKeyspaceState(ctx context.Context, id uint32, state key
 	return nil, nil
 }
 
-func (c *pdClient) ListResourceGroups(ctx context.Context) ([]*rmpb.ResourceGroup, error) {
+func (c *pdClient) ListResourceGroups(ctx context.Context, opts ...pd.GetResourceGroupOption) ([]*rmpb.ResourceGroup, error) {
 	return nil, nil
 }
 
-func (c *pdClient) GetResourceGroup(ctx context.Context, resourceGroupName string) (*rmpb.ResourceGroup, error) {
+func (c *pdClient) GetResourceGroup(ctx context.Context, resourceGroupName string, opts ...pd.GetResourceGroupOption) (*rmpb.ResourceGroup, error) {
 	group, ok := c.groups[resourceGroupName]
 	if !ok {
 		return nil, fmt.Errorf("the group %s does not exist", resourceGroupName)
@@ -403,3 +456,5 @@ func (c *pdClient) Put(ctx context.Context, key []byte, value []byte, opts ...pd
 func (m *pdClient) LoadResourceGroups(ctx context.Context) ([]*rmpb.ResourceGroup, int64, error) {
 	return nil, 0, nil
 }
+
+func (m *pdClient) GetServiceDiscovery() pd.ServiceDiscovery { return nil }

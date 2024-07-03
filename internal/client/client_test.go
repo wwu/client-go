@@ -37,6 +37,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"runtime"
 	"strconv"
@@ -79,12 +80,18 @@ func TestConn(t *testing.T) {
 	assert.Nil(t, err)
 	assert.False(t, conn2.Get() == conn1.Get())
 
-	assert.Nil(t, client.CloseAddr(addr))
+	ver := conn2.ver
+	assert.Nil(t, client.CloseAddrVer(addr, ver-1))
 	_, ok := client.conns[addr]
+	assert.True(t, ok)
+	assert.Nil(t, client.CloseAddrVer(addr, ver))
+	_, ok = client.conns[addr]
 	assert.False(t, ok)
+
 	conn3, err := client.getConnArray(addr, true)
 	assert.Nil(t, err)
 	assert.NotNil(t, conn3)
+	assert.Equal(t, ver+1, conn3.ver)
 
 	client.Close()
 	conn4, err := client.getConnArray(addr, true)
@@ -111,19 +118,25 @@ func TestCancelTimeoutRetErr(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	cancel()
-	_, err := sendBatchRequest(ctx, "", "", a, req, 2*time.Second)
+	_, err := sendBatchRequest(ctx, "", "", a, req, 2*time.Second, 0)
 	assert.Equal(t, errors.Cause(err), context.Canceled)
 
-	_, err = sendBatchRequest(context.Background(), "", "", a, req, 0)
+	_, err = sendBatchRequest(context.Background(), "", "", a, req, 0, 0)
 	assert.Equal(t, errors.Cause(err), context.DeadlineExceeded)
 }
 
 func TestSendWhenReconnect(t *testing.T) {
 	server, port := mockserver.StartMockTikvService()
 	require.True(t, port > 0)
+	restoreFn := config.UpdateGlobal(func(conf *config.Config) {
+		conf.TiKVClient.MaxConcurrencyRequestLimit = 10000
+	})
 
 	rpcClient := NewRPCClient()
-	defer rpcClient.Close()
+	defer func() {
+		rpcClient.Close()
+		restoreFn()
+	}()
 	addr := server.Addr()
 	conn, err := rpcClient.getConnArray(addr, true)
 	assert.Nil(t, err)
@@ -134,8 +147,8 @@ func TestSendWhenReconnect(t *testing.T) {
 	}
 
 	req := tikvrpc.NewRequest(tikvrpc.CmdEmpty, &tikvpb.BatchCommandsEmptyRequest{})
-	_, err = rpcClient.SendRequest(context.Background(), addr, req, 100*time.Second)
-	assert.True(t, err.Error() == "no available connections")
+	_, err = rpcClient.SendRequest(context.Background(), addr, req, 5*time.Second)
+	require.Regexp(t, "wait recvLoop timeout, timeout:5s, wait_send_duration:.*, wait_recv_duration:.*: context deadline exceeded", err.Error())
 	server.Stop()
 }
 
@@ -152,6 +165,8 @@ func (c *chanClient) Close() error {
 func (c *chanClient) CloseAddr(addr string) error {
 	return nil
 }
+
+func (c *chanClient) SetEventListener(listener ClientEventListener) {}
 
 func (c *chanClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
 	c.wg.Wait()
@@ -386,7 +401,7 @@ func TestBatchCommandsBuilder(t *testing.T) {
 		assert.Equal(t, builder.len(), i+1)
 	}
 	entryMap := make(map[uint64]*batchCommandsEntry)
-	batchedReq, forwardingReqs := builder.build(func(id uint64, e *batchCommandsEntry) {
+	batchedReq, forwardingReqs := builder.buildWithLimit(math.MaxInt64, func(id uint64, e *batchCommandsEntry) {
 		entryMap[id] = e
 	})
 	assert.Equal(t, len(batchedReq.GetRequests()), 10)
@@ -412,7 +427,7 @@ func TestBatchCommandsBuilder(t *testing.T) {
 		}
 	}
 	entryMap = make(map[uint64]*batchCommandsEntry)
-	batchedReq, forwardingReqs = builder.build(func(id uint64, e *batchCommandsEntry) {
+	batchedReq, forwardingReqs = builder.buildWithLimit(math.MaxInt64, func(id uint64, e *batchCommandsEntry) {
 		entryMap[id] = e
 	})
 	assert.Equal(t, len(batchedReq.GetRequests()), 1)
@@ -422,8 +437,8 @@ func TestBatchCommandsBuilder(t *testing.T) {
 		assert.Equal(t, len(forwardingReqs[host].GetRequests()), i+2)
 		assert.Equal(t, len(forwardingReqs[host].GetRequestIds()), i+2)
 	}
-	assert.Equal(t, builder.idAlloc, uint64(10+builder.len()))
-	assert.Equal(t, len(entryMap), builder.len())
+	assert.Equal(t, int(builder.idAlloc), 20)
+	assert.Equal(t, len(entryMap), 10)
 	for host, forwardingReq := range forwardingReqs {
 		for i, id := range forwardingReq.GetRequestIds() {
 			assert.Equal(t, entryMap[id].req, forwardingReq.GetRequests()[i])
@@ -444,7 +459,7 @@ func TestBatchCommandsBuilder(t *testing.T) {
 		builder.push(entry)
 	}
 	entryMap = make(map[uint64]*batchCommandsEntry)
-	batchedReq, forwardingReqs = builder.build(func(id uint64, e *batchCommandsEntry) {
+	batchedReq, forwardingReqs = builder.buildWithLimit(math.MaxInt64, func(id uint64, e *batchCommandsEntry) {
 		entryMap[id] = e
 	})
 	assert.Equal(t, len(batchedReq.GetRequests()), 2)
@@ -475,7 +490,6 @@ func TestBatchCommandsBuilder(t *testing.T) {
 	// Test reset
 	builder.reset()
 	assert.Equal(t, builder.len(), 0)
-	assert.Equal(t, len(builder.entries), 0)
 	assert.Equal(t, len(builder.requests), 0)
 	assert.Equal(t, len(builder.requestIDs), 0)
 	assert.Equal(t, len(builder.forwardingReqs), 0)
@@ -483,7 +497,6 @@ func TestBatchCommandsBuilder(t *testing.T) {
 }
 
 func TestTraceExecDetails(t *testing.T) {
-
 	assert.Nil(t, buildSpanInfoFromResp(nil))
 	assert.Nil(t, buildSpanInfoFromResp(&tikvrpc.Response{}))
 	assert.Nil(t, buildSpanInfoFromResp(&tikvrpc.Response{Resp: &kvrpcpb.GetResponse{}}))
@@ -646,10 +659,6 @@ func TestTraceExecDetails(t *testing.T) {
 }
 
 func TestBatchClientRecoverAfterServerRestart(t *testing.T) {
-	config.UpdateGlobal(func(conf *config.Config) {
-		conf.TiKVClient.MaxBatchSize = 128
-	})()
-
 	server, port := mockserver.StartMockTikvService()
 	require.True(t, port > 0)
 	require.True(t, server.IsRunning())
@@ -666,7 +675,7 @@ func TestBatchClientRecoverAfterServerRestart(t *testing.T) {
 	assert.Nil(t, err)
 	// send some request, it should be success.
 	for i := 0; i < 100; i++ {
-		_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Second*20)
+		_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Second*20, 0)
 		require.NoError(t, err)
 	}
 
@@ -675,8 +684,8 @@ func TestBatchClientRecoverAfterServerRestart(t *testing.T) {
 	require.False(t, server.IsRunning())
 
 	// send some request, it should be failed since server is down.
-	for i := 0; i < 200; i++ {
-		_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Second*20)
+	for i := 0; i < 10; i++ {
+		_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Millisecond*100, 0)
 		require.Error(t, err)
 		time.Sleep(time.Millisecond * time.Duration(rand.Intn(300)))
 		grpcConn := conn.Get()
@@ -719,7 +728,342 @@ func TestBatchClientRecoverAfterServerRestart(t *testing.T) {
 
 	// send some request, it should be success again.
 	for i := 0; i < 100; i++ {
-		_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Second*20)
+		_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Second*20, 0)
 		require.NoError(t, err)
 	}
+}
+
+func TestLimitConcurrency(t *testing.T) {
+	re := require.New(t)
+	batch := newBatchConn(1, 128, nil)
+	{
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}})
+		reqs, _ := batch.reqBuilder.buildWithLimit(1, func(_ uint64, _ *batchCommandsEntry) {})
+		re.Len(reqs.RequestIds, 1)
+		re.Equal(0, batch.reqBuilder.len())
+		batch.reqBuilder.reset()
+	}
+
+	// highest priority task will be sent immediately, not limited by concurrency
+	{
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}, pri: highTaskPriority})
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}, pri: highTaskPriority - 1})
+		reqs, _ := batch.reqBuilder.buildWithLimit(0, func(_ uint64, _ *batchCommandsEntry) {})
+		re.Len(reqs.RequestIds, 1)
+		batch.reqBuilder.reset()
+		re.Equal(1, batch.reqBuilder.len())
+	}
+
+	// medium priority tasks are limited by concurrency
+	{
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}})
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}})
+		reqs, _ := batch.reqBuilder.buildWithLimit(2, func(_ uint64, _ *batchCommandsEntry) {})
+		re.Len(reqs.RequestIds, 2)
+		re.Equal(1, batch.reqBuilder.len())
+		batch.reqBuilder.reset()
+	}
+
+	// the expired tasks should be removed from the queue.
+	{
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}, canceled: 1})
+		batch.reqBuilder.push(&batchCommandsEntry{req: &tikvpb.BatchCommandsRequest_Request{}, canceled: 1})
+		batch.reqBuilder.reset()
+		re.Equal(1, batch.reqBuilder.len())
+	}
+
+}
+
+func TestPrioritySentLimit(t *testing.T) {
+	re := require.New(t)
+	restoreFn := config.UpdateGlobal(func(conf *config.Config) {
+		conf.TiKVClient.MaxConcurrencyRequestLimit = 2
+		conf.TiKVClient.GrpcConnectionCount = 1
+	})
+	defer restoreFn()
+
+	server, port := mockserver.StartMockTikvService()
+	re.Greater(port, 0)
+	rpcClient := NewRPCClient()
+	defer rpcClient.Close()
+	addr := server.Addr()
+	wait := sync.WaitGroup{}
+	bench := 10
+	wait.Add(bench * 2)
+	ctx, cancelFn := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancelFn()
+	sendFn := func(pri uint64, dur *atomic.Int64, qps *atomic.Int64) {
+		for i := 0; i < bench; i++ {
+			go func() {
+				for {
+					req := tikvrpc.NewRequest(tikvrpc.CmdEmpty, &tikvpb.BatchCommandsEmptyRequest{})
+					req.ResourceControlContext = &kvrpcpb.ResourceControlContext{OverridePriority: pri}
+					now := time.Now()
+					rpcClient.SendRequest(context.Background(), addr, req, 100*time.Millisecond)
+					dur.Add(time.Since(now).Microseconds())
+					qps.Add(1)
+					select {
+					case <-ctx.Done():
+						wait.Done()
+						return
+					default:
+					}
+				}
+			}()
+		}
+	}
+
+	highDur, mediumDur := atomic.Int64{}, atomic.Int64{}
+	highQps, mediumQps := atomic.Int64{}, atomic.Int64{}
+	go sendFn(16, &highDur, &highQps)
+	go sendFn(8, &mediumDur, &mediumQps)
+	wait.Wait()
+	re.Less(highDur.Load()/highQps.Load()*2, mediumDur.Load()/mediumQps.Load())
+	server.Stop()
+}
+
+type testClientEventListener struct {
+	healthFeedbackCh chan *kvrpcpb.HealthFeedback
+}
+
+func newTestClientEventListener() *testClientEventListener {
+	return &testClientEventListener{
+		healthFeedbackCh: make(chan *kvrpcpb.HealthFeedback, 100),
+	}
+}
+
+func (l *testClientEventListener) OnHealthFeedback(feedback *kvrpcpb.HealthFeedback) {
+	l.healthFeedbackCh <- feedback
+}
+
+func TestBatchClientReceiveHealthFeedback(t *testing.T) {
+	server, port := mockserver.StartMockTikvService()
+	require.True(t, port > 0)
+	require.True(t, server.IsRunning())
+	defer server.Stop()
+	addr := server.Addr()
+
+	client := NewRPCClient()
+	defer client.Close()
+
+	conn, err := client.getConnArray(addr, true)
+	assert.NoError(t, err)
+	tikvClient := tikvpb.NewTikvClient(conn.Get())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := tikvClient.BatchCommands(ctx)
+	assert.NoError(t, err)
+
+	for reqID := uint64(1); reqID <= 3; reqID++ {
+		assert.NoError(t, stream.Send(&tikvpb.BatchCommandsRequest{
+			Requests: []*tikvpb.BatchCommandsRequest_Request{{
+				Cmd: &tikvpb.BatchCommandsRequest_Request_Get{Get: &kvrpcpb.GetRequest{
+					Context: &kvrpcpb.Context{},
+					Key:     []byte("k"),
+					Version: 1,
+				}},
+			}},
+			RequestIds: []uint64{reqID},
+		}))
+		resp, err := stream.Recv()
+		assert.NoError(t, err)
+		assert.Equal(t, []uint64{reqID}, resp.GetRequestIds())
+		assert.Len(t, resp.GetResponses(), 1)
+		assert.Equal(t, uint64(1), resp.GetHealthFeedback().GetStoreId())
+		assert.Equal(t, reqID, resp.GetHealthFeedback().GetFeedbackSeqNo())
+		assert.Equal(t, int32(1), resp.GetHealthFeedback().GetSlowScore())
+	}
+	cancel()
+
+	eventListener := newTestClientEventListener()
+	client.SetEventListener(eventListener)
+	ctx = context.Background()
+	resp, err := client.SendRequest(ctx, addr, tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{}), time.Second)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp.Resp)
+
+	select {
+	case feedback := <-eventListener.healthFeedbackCh:
+		assert.Equal(t, uint64(1), feedback.GetStoreId())
+		assert.Equal(t, int32(1), feedback.GetSlowScore())
+	default:
+		assert.Fail(t, "health feedback not received")
+	}
+}
+
+func TestRandomRestartStoreAndForwarding(t *testing.T) {
+	store1, port1 := mockserver.StartMockTikvService()
+	require.True(t, port1 > 0)
+	require.True(t, store1.IsRunning())
+	client1 := NewRPCClient()
+	store2, port2 := mockserver.StartMockTikvService()
+	require.True(t, port2 > 0)
+	require.True(t, store2.IsRunning())
+	defer func() {
+		store1.Stop()
+		store2.Stop()
+		err := client1.Close()
+		require.NoError(t, err)
+	}()
+
+	wg := sync.WaitGroup{}
+	done := int64(0)
+	concurrency := 500
+	addr1 := store1.Addr()
+	addr2 := store2.Addr()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			// intermittent stop and start store1 or store2.
+			var store *mockserver.MockServer
+			if rand.Intn(10) < 9 {
+				store = store1
+			} else {
+				store = store2
+			}
+			time.Sleep(time.Millisecond * time.Duration(rand.Intn(200)))
+			addr := store.Addr()
+			store.Stop()
+			require.False(t, store.IsRunning())
+			time.Sleep(time.Millisecond * time.Duration(rand.Intn(200)))
+			store.Start(addr)
+			if atomic.LoadInt64(&done) >= int64(concurrency) {
+				return
+			}
+		}
+	}()
+
+	conn, err := client1.getConnArray(addr1, true)
+	assert.Nil(t, err)
+	for j := 0; j < concurrency; j++ {
+		wg.Add(1)
+		go func() {
+			defer func() {
+				atomic.AddInt64(&done, 1)
+				wg.Done()
+			}()
+			for i := 0; i < 5000; i++ {
+				req := &tikvpb.BatchCommandsRequest_Request{Cmd: &tikvpb.BatchCommandsRequest_Request_Coprocessor{Coprocessor: &coprocessor.Request{}}}
+				forwardedHost := ""
+				if i%2 != 0 {
+					forwardedHost = addr2
+				}
+				_, err := sendBatchRequest(context.Background(), addr1, forwardedHost, conn.batchConn, req, time.Millisecond*50, 0)
+				if err == nil ||
+					err.Error() == "EOF" ||
+					err.Error() == "rpc error: code = Unavailable desc = error reading from server: EOF" ||
+					strings.Contains(err.Error(), "context deadline exceeded") ||
+					strings.Contains(err.Error(), "connect: connection refused") ||
+					strings.Contains(err.Error(), "no available connections") ||
+					strings.Contains(err.Error(), "rpc error: code = Unavailable desc = error reading from server") {
+					continue
+				}
+				require.Fail(t, err.Error(), "unexpected error")
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, cli := range conn.batchConn.batchCommandsClients {
+		require.Equal(t, int64(9223372036854775807), cli.maxConcurrencyRequestLimit.Load())
+		require.True(t, cli.available() > 0, fmt.Sprintf("sent: %d", cli.sent.Load()))
+		require.True(t, cli.sent.Load() >= 0, fmt.Sprintf("sent: %d", cli.sent.Load()))
+	}
+}
+
+func TestFastFailRequest(t *testing.T) {
+	client := NewRPCClient()
+	defer func() {
+		err := client.Close()
+		require.NoError(t, err)
+	}()
+	start := time.Now()
+	unknownAddr := "127.0.0.1:52027"
+	req := tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{Key: []byte("key")})
+	_, err := client.sendRequest(context.Background(), unknownAddr, req, time.Second*20)
+	require.Equal(t, "context deadline exceeded", errors.Cause(err).Error())
+	require.True(t, time.Since(start) < time.Second*6) // fast fail when dial target failed.
+}
+
+func TestErrConn(t *testing.T) {
+	e := errors.New("conn error")
+	err1 := &ErrConn{Err: e, Addr: "127.0.0.1", Ver: 10}
+	err2 := &ErrConn{Err: e, Addr: "127.0.0.1", Ver: 10}
+
+	e3 := errors.New("conn error 3")
+	err3 := &ErrConn{Err: e3}
+
+	err4 := errors.New("not ErrConn")
+
+	assert.True(t, errors.Is(err1, err1))
+	assert.True(t, errors.Is(fmt.Errorf("%w", err1), err1))
+	assert.False(t, errors.Is(fmt.Errorf("%w", err2), err1)) // err2 != err1
+	assert.False(t, errors.Is(fmt.Errorf("%w", err4), err1))
+
+	var errConn *ErrConn
+	assert.True(t, errors.As(err1, &errConn))
+	assert.Equal(t, "127.0.0.1", errConn.Addr)
+	assert.EqualValues(t, 10, errConn.Ver)
+	assert.EqualError(t, errConn.Err, "conn error")
+
+	assert.True(t, errors.As(err3, &errConn))
+	assert.EqualError(t, e3, "conn error 3")
+
+	assert.False(t, errors.As(err4, &errConn))
+
+	errMsg := errors.New("unknown")
+	assert.True(t, errors.As(err1, &errMsg))
+	assert.EqualError(t, err1, errMsg.Error())
+}
+
+func TestFastFailWhenNoAvailableConn(t *testing.T) {
+	server, port := mockserver.StartMockTikvService()
+	require.True(t, port > 0)
+	require.True(t, server.IsRunning())
+	addr := server.Addr()
+	client := NewRPCClient()
+	defer func() {
+		err := client.Close()
+		require.NoError(t, err)
+		server.Stop()
+	}()
+
+	req := &tikvpb.BatchCommandsRequest_Request{Cmd: &tikvpb.BatchCommandsRequest_Request_Coprocessor{Coprocessor: &coprocessor.Request{}}}
+	conn, err := client.getConnArray(addr, true)
+	assert.Nil(t, err)
+	_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, time.Second, 0)
+	require.NoError(t, err)
+
+	for _, c := range conn.batchConn.batchCommandsClients {
+		// mock all client a in recreate.
+		c.lockForRecreate()
+	}
+	start := time.Now()
+	timeout := time.Second
+	_, err = sendBatchRequest(context.Background(), addr, "", conn.batchConn, req, timeout, 0)
+	require.Error(t, err)
+	require.Equal(t, "no available connections", err.Error())
+	require.Less(t, time.Since(start), timeout)
+}
+
+func TestConcurrentCloseConnPanic(t *testing.T) {
+	client := NewRPCClient()
+	addr := "127.0.0.1:6379"
+	_, err := client.getConnArray(addr, true)
+	assert.Nil(t, err)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		err := client.Close()
+		assert.Nil(t, err)
+	}()
+	go func() {
+		defer wg.Done()
+		err := client.CloseAddr(addr)
+		assert.Nil(t, err)
+	}()
+	wg.Wait()
 }

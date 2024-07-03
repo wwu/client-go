@@ -2466,10 +2466,10 @@ func (s *testCommitterSuite) TestFlagsInMemBufferMutations() {
 	})
 
 	// Create memBufferMutations object and add keys with flags to it.
-	mutations := transaction.NewMemBufferMutationsProbe(db.Len(), db)
+	mutations := transaction.NewMemBufferMutationsProbe(db.Len(), db.GetMemDB())
 
 	forEachCase(func(op kvrpcpb.Op, key []byte, value []byte, i int, isPessimisticLock, assertExist, assertNotExist bool) {
-		handle := db.IterWithFlags(key, nil).Handle()
+		handle := db.GetMemDB().IterWithFlags(key, nil).Handle()
 		mutations.Push(op, isPessimisticLock, assertExist, assertNotExist, false, handle)
 	})
 
@@ -2499,6 +2499,16 @@ func (s *testCommitterSuite) TestExtractKeyExistsErr() {
 	txn.GetMemBuffer().UpdateFlags([]byte("de"), kv.DelPresumeKeyNotExists)
 	err = committer.PrewriteAllMutations(context.Background())
 	s.ErrorContains(err, "existErr")
-	s.True(txn.GetMemBuffer().TryLock())
-	txn.GetMemBuffer().Unlock()
+	s.True(txn.GetMemBuffer().GetMemDB().TryLock())
+	txn.GetMemBuffer().GetMemDB().Unlock()
+}
+
+func (s *testCommitterSuite) TestKillSignal() {
+	txn := s.begin()
+	err := txn.Set([]byte("key"), []byte("value"))
+	s.Nil(err)
+	var killed uint32 = 2
+	txn.SetVars(kv.NewVariables(&killed))
+	err = txn.Commit(context.Background())
+	s.ErrorContains(err, "query interrupted")
 }
